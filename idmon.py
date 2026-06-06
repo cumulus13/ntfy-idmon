@@ -3,38 +3,37 @@
 # File: idmon.py
 # Author: Hadi Cahyadi <cumulus13@gmail.com>
 # Date: 2026-06-07
-# Description: live download monitor utilizing for idm.internet.download.manager.plus via NTFY
+# Description: Production-ready download monitor using gntplib and optional telemetry speed graphs
 # License: MIT
 
 import os
 import sys
 import json
 import time
+import re
 import asyncio
 import argparse
-
-try:
-    from rchf import CustomRichHelpFormatter  # type: ignore
-except:
-    CustomRichHelpFormatter = argparse.RawTextHelpFormatter
-
 from datetime import datetime
+from collections import deque
 from rich.live import Live
 from rich.table import Table
-from rich.console import Console
-try:
-    from pathlib3 import Path  # type: ignore
-except:
-    from pathlib import Path
+from rich.console import Console, Group
+from rich.panel import Panel
 
-# --- Safe gntplib Mapping ---
+# --- Safe External Dependency Mappings ---
 try:
-    import gntplib  # type: ignore
+    import gntplib
     HAS_GNTPLIB = True
 except ImportError:
     HAS_GNTPLIB = False
 
-# --- Production Dependency Validation ---
+try:
+    import asciichartpy as asciichart
+    HAS_ASCIICHART = True
+except ImportError:
+    asciichart = None
+    HAS_ASCIICHART = False
+
 try:
     import aiohttp
 except ImportError:
@@ -42,11 +41,17 @@ except ImportError:
     print("Execute: pip install aiohttp", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from rchf import CustomRichHelpFormatter  # type: ignore
+except ImportError:
+    CustomRichHelpFormatter = argparse.RawTextHelpFormatter
+
 # --- Global Operational State ---
 DEBUG_MODE = False
 console = Console()
 GLOBAL_CONFIG = {}
-gntp_publisher = None  # Persistent global publisher instance
+gntp_publisher = None
+
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
@@ -96,45 +101,52 @@ def resolve_config(args):
     }
 
 
-# --- Corrected GNTP Delivery Workers ---
+# --- GNTP Delivery Workers ---
 def init_gntp_publisher():
-    """Initializes and registers the application according to real gntplib specifications."""
     global gntp_publisher
     if not HAS_GNTPLIB:
         return
-
     try:
-        # gntplib signature expects: app_name, [notification_types], hostname, port, password
         gntp_publisher = gntplib.Publisher(
             "NTFY-IDM Monitor",
             ["Download Update", "System Error"],
             hostname=GLOBAL_CONFIG["growl_host"],
             port=GLOBAL_CONFIG["growl_port"],
-            password=GLOBAL_CONFIG["growl_password"] if GLOBAL_CONFIG["growl_password"] else None,
-            icon=GLOBAL_CONFIG["icon"] if GLOBAL_CONFIG["icon"] else str(Path(__file__).parent / 'logo.png')
+            password=GLOBAL_CONFIG["growl_password"] if GLOBAL_CONFIG["growl_password"] else None
         )
-        # GNTP protocol requires a distinct initial registration pass
         gntp_publisher.register()
     except Exception as e:
         if DEBUG_MODE:
             print(f"[DEBUG-GROWL-INIT-ERR] Failed to register gntplib client: {e}", file=sys.stderr)
 
 def send_growl_notification(title, message, notification_type="Download Update"):
-    """Dispatches updates asynchronously via gntplib.Publisher without locking up UI threads."""
     global gntp_publisher
     if not HAS_GNTPLIB or not gntp_publisher:
         return
-
     try:
-        # Correct gntplib method: publish(name, title, text, priority=0, sticky=False, icon=None)
-        gntp_publisher.publish(
-            notification_type,
-            title,
-            message
-        )
+        gntp_publisher.publish(notification_type, title, message)
     except Exception as e:
         if DEBUG_MODE:
             print(f"[DEBUG-GROWL-ERR] gntplib delivery fault: {e}", file=sys.stderr)
+
+
+# --- Helper to Normalize Speeds to Numeric KB/s Values ---
+def parse_speed_to_kb(speed_str) -> float:
+    """Extracts raw numeric speed value as KB/s float for math or charts calculation."""
+    try:
+        clean_str = speed_str.strip().upper()
+        match = re.search(r"([0-9.]+)\s*([KMG]?B/S)", clean_str)
+        if not match:
+            return 0.0
+        val = float(match.group(1))
+        unit = match.group(2)
+        if "GB/S" in unit:
+            return val * 1024 * 1024
+        if "MB/S" in unit:
+            return val * 1024
+        return val
+    except Exception:
+        return 0.0
 
 
 # --- State Management & Parsing Engine ---
@@ -143,20 +155,17 @@ class DownloadMonitor:
         self.current_state = None
         self.previous_state = None
         self.locked_complete = False
+        # Telemetry ring buffer ring size matching terminal charts dimensions
+        self.speed_history = deque(maxlen=40)
 
     def parse_raw_data(self, raw_str) -> bool:
         if self.locked_complete:
             return True
-
         if not raw_str or not raw_str.strip():
             return False
 
         try:
             data = json.loads(raw_str.strip())
-            
-            if DEBUG_MODE:
-                console.print(f"[bold yellow][DEBUG-RAW][/bold yellow] Incoming packet: {data}")
-
             if data.get("event") not in (None, "message"):
                 return False
 
@@ -180,7 +189,6 @@ class DownloadMonitor:
             if isinstance(msg_obj, dict) and "title" in msg_obj:
                 title = msg_obj.get("title", "")
                 clean_title = title.replace("📱", "").strip()
-                
                 if not clean_title.startswith("idm.internet."):
                     return False  
                 
@@ -218,6 +226,10 @@ class DownloadMonitor:
                 "timestamp": timestamp
             }
 
+            # Update historical speed telemetry buffer
+            numeric_speed = parse_speed_to_kb(speed)
+            self.speed_history.append(numeric_speed)
+
             if percent == "100%":
                 self.locked_complete = True
                 asyncio.to_thread(
@@ -226,18 +238,15 @@ class DownloadMonitor:
                     f"Asset: {name}\nSize: {size}",
                     "Download Update"
                 )
-
             return True
         except Exception as err:
-            asyncio.to_thread(
-                send_growl_notification,
-                "❌ Parser Processing Error",
-                f"Failed runtime execution block framework loop. Fault: {err}",
-                "System Error"
-            )
+            if DEBUG_MODE:
+                console.print(f"[DEBUG-PARSE-ERR] {err}")
             return False
 
-    def build_table(self) -> Table:
+    def build_layout(self):
+        """Builds a rich compound group layout combining data tables and asciicharts."""
+        # Step 1: Generate Core Status Table Object
         table = Table(title="📡 Live NTFY-IDM Monitor", title_style="bold magenta", expand=True)
         table.add_column("Progress", justify="right")
         table.add_column("Name", style="white", ratio=2)
@@ -253,7 +262,6 @@ class DownloadMonitor:
             return table
 
         curr, prev = self.current_state, self.previous_state
-        
         if self.locked_complete:
             status = "✅ [green]done[/green]"
             progress_style = "[bold green]100%[/bold green]"
@@ -265,20 +273,41 @@ class DownloadMonitor:
                 status = "⚡ [green]run[/green]"
 
         table.add_row(
-            progress_style, 
-            curr["name"], 
-            curr["size"], 
-            curr["speed"], 
-            curr["eta"], 
-            curr["total_duration"], 
-            status, 
-            curr["timestamp"]
+            progress_style, curr["name"], curr["size"], curr["speed"],
+            curr["eta"], curr["total_duration"], status, curr["timestamp"]
         )
-        return table
+
+        # Step 2: Create Speed Telemetry Graph Widget Panel
+        if HAS_ASCIICHART:
+            if len(self.speed_history) > 1:
+                try:
+                    # Convert our ring queue into raw sequential coordinates array
+                    data_points = list(self.speed_history)
+                    # Force padded values to avoid charts clipping calculations on pure idle states
+                    if max(data_points) == 0:
+                        data_points[-1] = 0.01
+                    
+                    chart_output = asciichart.plot(data_points, {'height': 6, 'format': '{:8.1f} KB/s'})
+                    graph_widget = Panel(
+                        chart_output, 
+                        title="📈 Real-Time Speed Telemetry (KB/s)", 
+                        border_style="cyan",
+                        expand=True
+                    )
+                except Exception:
+                    graph_widget = Panel("[yellow]Telemetry rendering synchronization offset...[/yellow]", border_style="dim red")
+            else:
+                graph_widget = Panel("[dim white]Collecting metrics tracking telemetry sequences...[/dim white]", border_style="dim cyan")
+        else:
+            graph_widget = Panel("[dim red]ℹ pip install asciichartpy to enable dynamic tracking telemetry charts[/dim red]", border_style="dim white")
+
+        # Returns cohesive rich structural container stack
+        return Group(table, graph_widget)
 
 
 # --- Global Instance Initialization ---
 monitor = DownloadMonitor()
+
 
 # --- Network Context Operators ---
 async def handle_client(reader, writer):
@@ -328,7 +357,6 @@ async def main_application_loop(is_ntfy_active, target_ntfy_url):
     host = GLOBAL_CONFIG["host"]
     port = GLOBAL_CONFIG["port"]
 
-    # Initialize GNTP Registration Pass before kicking off stream loops
     if HAS_GNTPLIB:
         await asyncio.to_thread(init_gntp_publisher)
 
@@ -343,7 +371,7 @@ async def main_application_loop(is_ntfy_active, target_ntfy_url):
         else:
             await run_server(host, port)
     else:
-        with Live(get_renderable=monitor.build_table, refresh_per_second=2, console=console):
+        with Live(get_renderable=monitor.build_layout, refresh_per_second=2, console=console):
             while True:
                 await asyncio.sleep(1)
 
