@@ -3,7 +3,7 @@
 # File: idmon.py
 # Author: Hadi Cahyadi <cumulus13@gmail.com>
 # Date: 2026-06-07
-# Description: Production-ready download monitor using gntplib and optional telemetry speed graphs
+# Description: Production-ready download monitor with dynamic, un-padded chart tracking
 # License: MIT
 
 import os
@@ -18,7 +18,6 @@ from collections import deque
 from rich.live import Live
 from rich.table import Table
 from rich.console import Console, Group
-from rich.panel import Panel
 
 # --- Safe External Dependency Mappings ---
 try:
@@ -155,12 +154,11 @@ class DownloadMonitor:
         self.current_state = None
         self.previous_state = None
         self.locked_complete = False
-        # Telemetry ring buffer ring size matching terminal charts dimensions
-        self.speed_history = deque(maxlen=40)
+        self.last_notified_asset = None
+        # Max buffer size allowed to scale inside standard wide terminal viewports
+        self.speed_history = deque(maxlen=500)
 
     def parse_raw_data(self, raw_str) -> bool:
-        if self.locked_complete:
-            return True
         if not raw_str or not raw_str.strip():
             return False
 
@@ -213,6 +211,11 @@ class DownloadMonitor:
                     return False
                 name, percent, size, speed, eta, total_duration = val_str, "0%", "Unknown", "0KB/s", "--", "--"
 
+            # Reset logic for new asset item arrivals
+            if self.current_state and name != self.current_state.get("name"):
+                self.locked_complete = False
+                self.speed_history.clear()
+
             timestamp = datetime.fromtimestamp(data.get("time", time.time())).strftime('%Y-%m-%d %H:%M:%S')
 
             self.previous_state = self.current_state
@@ -226,12 +229,12 @@ class DownloadMonitor:
                 "timestamp": timestamp
             }
 
-            # Update historical speed telemetry buffer
             numeric_speed = parse_speed_to_kb(speed)
             self.speed_history.append(numeric_speed)
 
-            if percent == "100%":
+            if percent == "100%" and self.last_notified_asset != name:
                 self.locked_complete = True
+                self.last_notified_asset = name
                 asyncio.to_thread(
                     send_growl_notification, 
                     "📥 Download Complete!", 
@@ -245,8 +248,7 @@ class DownloadMonitor:
             return False
 
     def build_layout(self):
-        """Builds a rich compound group layout combining data tables and asciicharts."""
-        # Step 1: Generate Core Status Table Object
+        """Builds a secure flat layout where the chart grows naturally without zero-padding chaos."""
         table = Table(title="📡 Live NTFY-IDM Monitor", title_style="bold magenta", expand=True)
         table.add_column("Progress", justify="right")
         table.add_column("Name", style="white", ratio=2)
@@ -262,7 +264,7 @@ class DownloadMonitor:
             return table
 
         curr, prev = self.current_state, self.previous_state
-        if self.locked_complete:
+        if self.locked_complete or curr['percent'] == "100%":
             status = "✅ [green]done[/green]"
             progress_style = "[bold green]100%[/bold green]"
         else:
@@ -277,33 +279,25 @@ class DownloadMonitor:
             curr["eta"], curr["total_duration"], status, curr["timestamp"]
         )
 
-        # Step 2: Create Speed Telemetry Graph Widget Panel
-        if HAS_ASCIICHART:
-            if len(self.speed_history) > 1:
-                try:
-                    # Convert our ring queue into raw sequential coordinates array
-                    data_points = list(self.speed_history)
-                    # Force padded values to avoid charts clipping calculations on pure idle states
-                    if max(data_points) == 0:
-                        data_points[-1] = 0.01
-                    
-                    chart_output = asciichart.plot(data_points, {'height': 6, 'format': '{:8.1f} KB/s'})
-                    graph_widget = Panel(
-                        chart_output, 
-                        title="📈 Real-Time Speed Telemetry (KB/s)", 
-                        border_style="cyan",
-                        expand=True
-                    )
-                except Exception:
-                    graph_widget = Panel("[yellow]Telemetry rendering synchronization offset...[/yellow]", border_style="dim red")
-            else:
-                graph_widget = Panel("[dim white]Collecting metrics tracking telemetry sequences...[/dim white]", border_style="dim cyan")
+        if HAS_ASCIICHART and len(self.speed_history) > 1:
+            try:
+                # Read dynamic terminal width to safeguard layout edge wraps
+                term_width = console.size.width
+                safe_width = max(10, term_width - 16)
+                
+                # Extract historical data without forcing structural artificial zero metrics
+                data_points = list(self.speed_history)[-safe_width:]
+                
+                if max(data_points) == 0:
+                    data_points[-1] = 0.01
+                
+                chart_output = asciichart.plot(data_points, {'height': 6, 'format': '{:8.1f} KB/s'})
+                return Group(table, "", "📈 [cyan]Real-Time Speed Telemetry[/cyan]", chart_output)
+            except Exception:
+                return Group(table, "", "[yellow]Telemetry rendering synchronization offset...[/yellow]")
         else:
-            graph_widget = Panel("[dim red]ℹ pip install asciichartpy to enable dynamic tracking telemetry charts[/dim red]", border_style="dim white")
-
-        # Returns cohesive rich structural container stack
-        return Group(table, graph_widget)
-
+            return Group(table, "", "[dim white]Collecting metrics tracking telemetry sequences...[/dim white]")
+    
 
 # --- Global Instance Initialization ---
 monitor = DownloadMonitor()
