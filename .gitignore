@@ -3,3 +3,12 @@
 *.sublime-*
 # PT backup directory
 .pt/
+
+# Added entries (7 items)
+idmon1.py
+idmon2.py
+idmon3.py
+idmon4.py
+idmon5.py
+idmon6.py
+idmon7.py
